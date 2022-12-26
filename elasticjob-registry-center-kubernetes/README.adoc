@@ -1,0 +1,25 @@
+= ElasticJob Kubernetes Registry Center
+
+== Usage
+
+Job name must be a valid Kubernetes object name. 
+
+Regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?'
+
+Valid case:
+
+* myjob
+* my-job
+
+Invalid case:
+
+* my_job
+
+[,java]
+----
+String namespace = "elasticjob";
+CoordinatorRegistryCenter registryCenter = new KubernetesRegistryCenter(namespace);
+registryCenter.init();
+// Just use it as ElasticJob before
+OneOffJobBootstrap bootstrap = new OneOffJobBootstrap(registryCenter, job, jobConfiguration);
+----
