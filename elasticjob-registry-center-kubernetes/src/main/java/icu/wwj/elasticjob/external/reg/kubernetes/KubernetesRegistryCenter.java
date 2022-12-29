@@ -2,7 +2,8 @@ package icu.wwj.elasticjob.external.reg.kubernetes;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.gson.reflect.TypeToken;
+import icu.wwj.elasticjob.external.reg.kubernetes.internal.ConfigMapCache;
+import icu.wwj.elasticjob.external.reg.kubernetes.internal.Escapes;
 import icu.wwj.elasticjob.external.reg.kubernetes.model.NodeValue;
 import io.kubernetes.client.custom.V1Patch;
 import io.kubernetes.client.extended.leaderelection.LeaderElectionConfig;
@@ -16,7 +17,6 @@ import io.kubernetes.client.openapi.models.V1ConfigMap;
 import io.kubernetes.client.openapi.models.V1ObjectMeta;
 import io.kubernetes.client.util.Config;
 import io.kubernetes.client.util.PatchUtils;
-import io.kubernetes.client.util.Watch;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.shardingsphere.elasticjob.reg.base.CoordinatorRegistryCenter;
@@ -24,28 +24,16 @@ import org.apache.shardingsphere.elasticjob.reg.base.LeaderExecutionCallback;
 import org.apache.shardingsphere.elasticjob.reg.base.transaction.TransactionOperation;
 import org.apache.shardingsphere.elasticjob.reg.exception.RegException;
 import org.apache.shardingsphere.elasticjob.reg.listener.ConnectionStateChangedEventListener;
-import org.apache.shardingsphere.elasticjob.reg.listener.DataChangedEvent;
-import org.apache.shardingsphere.elasticjob.reg.listener.DataChangedEvent.Type;
 import org.apache.shardingsphere.elasticjob.reg.listener.DataChangedEventListener;
 
 import java.io.IOException;
 import java.time.Duration;
-import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -56,15 +44,7 @@ import java.util.stream.Collectors;
 @Slf4j
 public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter {
     
-    private static final String LABEL_PREFIX = "elasticjob.shardingsphere.apache.org/";
-    
-    private static final String JOB_NAME_LABEL = LABEL_PREFIX + "jobName";
-    
-    private static final String ELASTICJOB_NAMESPACE_LABEL = LABEL_PREFIX + "namespace";
-    
-    private static final Pattern NAME_PATTERN = Pattern.compile("[a-z0-9]([-a-z0-9]*[a-z0-9])?([a-z0-9]([-a-z0-9]*[a-z0-9])?)*");
-    
-    private static final Pattern KEY_PATTERN = Pattern.compile("^/(?<name>" + NAME_PATTERN.pattern() + ").*$");
+    private static final Pattern KEY_PATTERN = Pattern.compile("^/(?<name>" + ElasticJobKubernetesConstants.NAME_PATTERN.pattern() + ").*$");
     
     private final String identity = UUID.randomUUID().toString();
     
@@ -76,19 +56,9 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     
     private final ApiClient apiClient;
     
-    private final String namespaceLabelSelector;
-    
     private final CoreV1Api coreV1Api;
     
-    private final Executor eventCallbackExecutor = Executors.newCachedThreadPool();
-    
-    private final Map<String, Map<String, String>> cachedConfigMaps = new ConcurrentHashMap<>();
-    
-    private final Map<String, List<DataChangedEventListener>> pathToListeners = new ConcurrentHashMap<>();
-    
-    private final Thread configMapWatchThread = new Thread(this::watchConfigMap);
-    
-    private final AtomicBoolean started = new AtomicBoolean();
+    private final ConfigMapCache configMapCache;
     
     public KubernetesRegistryCenter(final KubernetesRegistryConfiguration configuration) throws IOException {
         this(configuration, Config.defaultClient());
@@ -98,111 +68,27 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
         config = configuration;
         namespace = configuration.getNamespace();
         this.apiClient = apiClient;
-        namespaceLabelSelector = ELASTICJOB_NAMESPACE_LABEL + "=" + namespace;
         coreV1Api = new CoreV1Api(apiClient);
+        configMapCache = new ConfigMapCache(apiClient, namespace);
     }
     
     @Override
     public void init() {
-        started.set(true);
-        configMapWatchThread.start();
+        configMapCache.init();
     }
     
     @Override
     public void close() {
-        started.set(false);
-        configMapWatchThread.interrupt();
-    }
-    
-    private void watchConfigMap() {
-        while (started.get()) {
-            try {
-                Watch<V1ConfigMap> watch = Watch.createWatch(apiClient,
-                        coreV1Api.listNamespacedConfigMapCall(namespace, null, null, null, null, namespaceLabelSelector, 1, null, null, null, Boolean.TRUE, null),
-                        new TypeToken<Watch.Response<V1ConfigMap>>() {
-                        }.getType());
-                for (Watch.Response<V1ConfigMap> each : watch) {
-                    log.debug("ConfigMap {} {}", each.object.getMetadata().getName(), each.type);
-                    String configMapName = each.object.getMetadata().getName();
-                    Map<String, String> data = Collections.unmodifiableMap(Optional.ofNullable(each.object.getData()).orElseGet(Collections::emptyMap));
-                    switch (each.type) {
-                        case "ADDED":
-                            cachedConfigMaps.put(configMapName, data);
-                            handleConfigMapAddedOrDeleted(data, Type.ADDED);
-                            break;
-                        case "MODIFIED":
-                            handleConfigMapModified(cachedConfigMaps.get(configMapName), data);
-                            cachedConfigMaps.put(configMapName, data);
-                            break;
-                        case "DELETED":
-                            handleConfigMapAddedOrDeleted(data, Type.DELETED);
-                            cachedConfigMaps.remove(configMapName);
-                            break;
-                        case "ERROR":
-                        default:
-                    }
-                }
-            } catch (final ApiException ex) {
-                log.error(ex.getResponseBody(), ex);
-            } catch (final Exception ex) {
-                log.error(ex.getMessage(), ex);
-            }
-        }
-    }
-    
-    private void handleConfigMapModified(final Map<String, String> before, final Map<String, String> after) {
-        Map<String, String> added = new HashMap<>(after);
-        added.keySet().removeAll(before.keySet());
-        handleConfigMapAddedOrDeleted(added, Type.ADDED);
-        Map<String, String> deleted = new HashMap<>(before);
-        deleted.keySet().removeAll(after.keySet());
-        handleConfigMapAddedOrDeleted(deleted, Type.DELETED);
-        Set<String> existing = new HashSet<>(after.keySet());
-        existing.removeAll(added.keySet());
-        for (String each : existing) {
-            String valueBefore = before.get(each);
-            String valueAfter = after.get(each);
-            if (valueBefore.equals(valueAfter)) {
-                continue;
-            }
-            DataChangedEvent event = null;
-            for (Entry<String, List<DataChangedEventListener>> entry : pathToListeners.entrySet()) {
-                if (!each.startsWith(entry.getKey())) {
-                    continue;
-                }
-                if (null == event) {
-                    event = new DataChangedEvent(Type.UPDATED, revertDataKey(each, true), valueAfter);
-                }
-                for (DataChangedEventListener eachListener : entry.getValue()) {
-                    DataChangedEvent finalEvent = event;
-                    eventCallbackExecutor.execute(() -> eachListener.onChange(finalEvent));
-                }
-            }
-        }
-    }
-    
-    private void handleConfigMapAddedOrDeleted(final Map<String, String> data, final Type type) {
-        for (Entry<String, String> dataEntry : data.entrySet()) {
-            for (Entry<String, List<DataChangedEventListener>> entry : pathToListeners.entrySet()) {
-                String changedKey = dataEntry.getKey();
-                if (!changedKey.startsWith(entry.getKey())) {
-                    continue;
-                }
-                DataChangedEvent event = new DataChangedEvent(type, revertDataKey(changedKey, true), dataEntry.getValue());
-                for (DataChangedEventListener eachListener : entry.getValue()) {
-                    eventCallbackExecutor.execute(() -> eachListener.onChange(event));
-                }
-            }
-        }
+        configMapCache.destroy();
     }
     
     @Override
     public String getDirectly(final String key) {
         try {
             V1ConfigMap configMap = coreV1Api.readNamespacedConfigMap(getConfigMapName(key), namespace, null);
-            String encodedValue = configMap.getData().get(getDataKey(key));
-            return null == encodedValue ? null : objectMapper.readValue(encodedValue, NodeValue.class).getValue();
-        } catch (final ApiException | JsonProcessingException ex) {
+            String encodedValue = configMap.getData().get(Escapes.getDataKey(key));
+            return null == encodedValue ? null : decodeValue(encodedValue).getValue();
+        } catch (final ApiException ex) {
             throw new RegException(ex);
         }
     }
@@ -211,20 +97,19 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     public List<String> getChildrenKeys(final String key) {
         try {
             V1ConfigMap configMap = coreV1Api.readNamespacedConfigMap(getConfigMapName(key), namespace, null);
-            String prefix = getDataKey(key) + (key.endsWith("/") ? "" : ".");
+            String prefix = Escapes.getDataKey(key) + (key.endsWith("/") ? "" : ".");
             long current = System.currentTimeMillis();
             return configMap.getData().entrySet().stream().filter(each -> each.getKey().startsWith(prefix))
                     .filter(each -> isValid(current, each.getValue()))
-                    .map(each -> revertDataKey(each.getKey().substring(prefix.length()).split("\\.", 2)[0], false))
+                    .map(each -> Escapes.revertDataKey(each.getKey().substring(prefix.length()).split("\\.", 2)[0], false))
                     .sorted(Comparator.reverseOrder()).collect(Collectors.toList());
         } catch (final ApiException ex) {
             throw new RegException(ex);
         }
     }
     
-    @SneakyThrows(JsonProcessingException.class)
     private boolean isValid(final long currentMillis, final String encodedValue) {
-        return currentMillis < objectMapper.readValue(encodedValue, NodeValue.class).getExpiredAt();
+        return currentMillis < decodeValue(encodedValue).getExpiredAt();
     }
     
     @Override
@@ -264,7 +149,7 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     
     @Override
     public void executeInLeader(final String key, final LeaderExecutionCallback callback) {
-        String leaseName = getConfigMapName(key) + '-' + getDataKey(key);
+        String leaseName = getConfigMapName(key) + '-' + Escapes.getDataKey(key);
         Lock lock = new LeaseLock(namespace, leaseName, identity, apiClient);
         LeaderElectionConfig leaderElectionConfig = new LeaderElectionConfig(lock, Duration.ofMillis(10000), Duration.ofMillis(8000), Duration.ofMillis(2000));
         try (LeaderElector leaderElector = new LeaderElector(leaderElectionConfig)) {
@@ -278,12 +163,11 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     
     @Override
     public void watch(final String key, final DataChangedEventListener listener, final Executor executor) {
-        pathToListeners.computeIfAbsent(getDataKey(key), k -> new CopyOnWriteArrayList<>()).add(listener);
+        configMapCache.watch(key, listener);
     }
     
     @Override
     public void addConnectionStateChangedEventListener(final ConnectionStateChangedEventListener listener) {
-        
     }
     
     @Override
@@ -302,15 +186,14 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
         }
     }
     
-    @SneakyThrows(JsonProcessingException.class)
     private Optional<String> translateToJsonPatch(final TransactionOperation operation) {
         switch (operation.getType()) {
             case ADD:
-                return Optional.of("{\"op\":\"add\",\"path\":\"/data/" + getDataKey(operation.getKey()) + "\",\"value\":\"" + escapeValueForJsonPatch(objectMapper.writeValueAsString(new NodeValue(operation.getValue()))) + "\"}");
+                return Optional.of("{\"op\":\"add\",\"path\":\"/data/" + Escapes.getDataKey(operation.getKey()) + "\",\"value\":\"" + Escapes.escapeDoubleQuote(encodeValue(new NodeValue(operation.getValue()))) + "\"}");
             case UPDATE:
-                return Optional.of("{\"op\":\"replace\",\"path\":\"/data/" + getDataKey(operation.getKey()) + "\",\"value\":\"" + escapeValueForJsonPatch(objectMapper.writeValueAsString(new NodeValue(operation.getValue()))) + "\"}");
+                return Optional.of("{\"op\":\"replace\",\"path\":\"/data/" + Escapes.getDataKey(operation.getKey()) + "\",\"value\":\"" + Escapes.escapeDoubleQuote(encodeValue(new NodeValue(operation.getValue()))) + "\"}");
             case DELETE:
-                return Optional.of("{\"op\":\"remove\",\"path\":\"/data/" + getDataKey(operation.getKey()) + "\"}");
+                return Optional.of("{\"op\":\"remove\",\"path\":\"/data/" + Escapes.getDataKey(operation.getKey()) + "\"}");
             case CHECK_EXISTS:
             default:
                 return Optional.empty();
@@ -325,10 +208,16 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     @Override
     public boolean isExisted(final String key) {
         try {
-            return coreV1Api.readNamespacedConfigMap(getConfigMapName(key), namespace, null).getData().containsKey(getDataKey(key));
+            return Optional.ofNullable(coreV1Api.readNamespacedConfigMap(getConfigMapName(key), namespace, null).getData().get(Escapes.getDataKey(key)))
+                    .map(this::decodeValue).map(value -> System.currentTimeMillis() < value.getExpiredAt()).orElse(false);
         } catch (final ApiException ignored) {
             return false;
         }
+    }
+    
+    @SneakyThrows(JsonProcessingException.class)
+    private NodeValue decodeValue(final String value) {
+        return objectMapper.readValue(value, NodeValue.class);
     }
     
     @Override
@@ -336,11 +225,10 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
         persist(key, new NodeValue(value));
     }
     
-    @SneakyThrows(JsonProcessingException.class)
     private void persist(final String key, final NodeValue nodeValue) {
-        String encodedValue = objectMapper.writeValueAsString(nodeValue);
-        String dataKey = getDataKey(key);
-        String jsonPatchString = "[{\"op\":\"add\",\"path\":\"/data/" + dataKey + "\",\"value\":\"" + escapeValueForJsonPatch(encodedValue) + "\"}]";
+        String encodedValue = encodeValue(nodeValue);
+        String dataKey = Escapes.getDataKey(key);
+        String jsonPatchString = "[{\"op\":\"add\",\"path\":\"/data/" + dataKey + "\",\"value\":\"" + Escapes.escapeDoubleQuote(encodedValue) + "\"}]";
         try {
             doJsonPatch(key, jsonPatchString);
         } catch (final ApiException ex) {
@@ -353,8 +241,8 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
     
     private void createConfigMap(final String key, final String encodedValue) {
         String configMapName = getConfigMapName(key);
-        V1ObjectMeta metadata = new V1ObjectMeta().name(configMapName).putLabelsItem(JOB_NAME_LABEL, configMapName).putLabelsItem(ELASTICJOB_NAMESPACE_LABEL, namespace);
-        V1ConfigMap configMap = new V1ConfigMap().putDataItem(getDataKey(key), encodedValue).metadata(metadata);
+        V1ObjectMeta metadata = new V1ObjectMeta().name(configMapName).putLabelsItem(ElasticJobKubernetesConstants.JOB_NAME_LABEL, configMapName).putLabelsItem(ElasticJobKubernetesConstants.ELASTICJOB_NAMESPACE_LABEL, namespace);
+        V1ConfigMap configMap = new V1ConfigMap().putDataItem(Escapes.getDataKey(key), encodedValue).metadata(metadata);
         try {
             coreV1Api.createNamespacedConfigMap(namespace, configMap, null, null, null, null);
         } catch (final ApiException ex) {
@@ -362,10 +250,9 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
         }
     }
     
-    @SneakyThrows(JsonProcessingException.class)
     @Override
     public void update(final String key, final String value) {
-        String jsonPatchString = "[{\"op\":\"replace\",\"path\":\"/data/" + getDataKey(key) + "\",\"value\":\"" + escapeValueForJsonPatch(objectMapper.writeValueAsString(new NodeValue(value))) + "\"}]";
+        String jsonPatchString = "[{\"op\":\"replace\",\"path\":\"/data/" + Escapes.getDataKey(key) + "\",\"value\":\"" + Escapes.escapeDoubleQuote(encodeValue(new NodeValue(value))) + "\"}]";
         try {
             doJsonPatch(key, jsonPatchString);
         } catch (final ApiException ex) {
@@ -373,9 +260,14 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
         }
     }
     
+    @SneakyThrows(JsonProcessingException.class)
+    private String encodeValue(final NodeValue nodeValue) {
+        return objectMapper.writeValueAsString(nodeValue);
+    }
+    
     @Override
     public void remove(final String key) {
-        String jsonPatchString = "[{\"op\":\"remove\",\"path\":\"/data/" + getDataKey(key) + "\"}]";
+        String jsonPatchString = "[{\"op\":\"remove\",\"path\":\"/data/" + Escapes.getDataKey(key) + "\"}]";
         try {
             doJsonPatch(key, jsonPatchString);
         } catch (final ApiException ex) {
@@ -395,18 +287,6 @@ public final class KubernetesRegistryCenter implements CoordinatorRegistryCenter
             throw new IllegalArgumentException(key);
         }
         return matcher.group("name");
-    }
-    
-    private String getDataKey(final String key) {
-        return key.substring(1).replace("@", "__at__").replace(".", "__dot__").replace('/', '.');
-    }
-    
-    private String revertDataKey(final String dataKey, final boolean absolutePath) {
-        return (absolutePath ? '/' : "") + dataKey.replace('.', '/').replace("__dot__", ".").replace("__at__", "@");
-    }
-    
-    private String escapeValueForJsonPatch(final String value) {
-        return value.replace("\"", "\\\"");
     }
     
     @Override
